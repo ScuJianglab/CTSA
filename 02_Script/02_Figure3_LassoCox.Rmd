@@ -1,0 +1,666 @@
+---
+title: "Figure3 Results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#1. loading package and data
+
+##1.1. package
+```{r,message=FALSE,warning=FALSE}
+library(readxl)
+library(xlsx)
+library(magrittr)
+library(data.table)
+library(survival)
+library(glmnet)
+library(RColorBrewer)
+library(corrplot)
+library(dplyr)
+library(plyr)
+library(ggpubr)
+library(survminer)
+library(survivalROC)
+library(ggalt)
+library(rms)
+#
+library(tidyverse)
+library(ROCR)
+library(timeROC)
+library(pROC)
+library(ggsci)
+library(plotROC)
+library(broom)
+library(paletteer)
+library(dcurves)
+```
+##1.2. data
+
+###1.2.1. Metainfo
+```{r}
+Info_all <- read_excel("../01_Data/COX_metainfo.xlsx")%>%as.data.table()
+Info_all$Samplename <- paste0(Info_all$Image,"_",Info_all$location)
+setkey(Info_all,Samplename)
+#
+Info <- Surv(Info_all$OS,Info_all$DEATH)%>%as.matrix()
+```
+###1.2.2.  Expression
+```{r}
+Express <- xlsx::read.xlsx("../01_Data/COX_clusterinfo.xlsx",sheetIndex = 1)%>%as.data.frame()
+Rowname <- paste0(Express$Image,"_",Express$location)
+rownames(Express) <- Rowname
+Express <- Express[,-c(1,2,21)]
+#
+colnames(Express) <- gsub("infiltrated","proximal",colnames(Express))
+colnames(Express) <- gsub("stromal","distal",colnames(Express))
+Express%<>%as.matrix()
+```
+###1.2.3. Cell percentage
+```{r}
+Bili <- Express%>%as.data.frame()
+Bili$rowsum <- rowSums(Bili)%>%as.character()
+Bili$Samplename <- rownames(Bili)
+Bili <- melt(Bili)%>%as.data.table()
+Bili$rowsum%<>%as.numeric()
+Bili$Percentage <- Bili$value/Bili$rowsum
+Bili <- Bili[,c("Samplename","variable","Percentage")]
+Bili <- reshape2::dcast(Bili,formula = variable~Samplename,value.var = "Percentage")
+rownames(Bili) <- Bili$variable
+Bili <- Bili[,-1]
+```
+###1.2.4. data filling
+```{r}
+Bili_new <- lapply(rownames(Bili), function(x){
+           DF <- Bili[x,]
+           DF[which(DF==0)] <- median(DF%>%as.numeric())
+           return(DF)
+}
+)
+Bili_new <- do.call(rbind,Bili_new)
+Bili <- Bili_new
+```
+
+
+#2. Lasso Cox
+
+##2.1. randomly drawing sample
+```{r}
+#
+set.seed(321)
+ind <- sample(x=c(1,2), size = ncol(Bili), replace = TRUE, prob = c(0.6,0.4))
+
+# Training
+train_express <- Bili[,ind==1] 
+train_express%<>%t()%>%as.data.frame()
+train_express$stage <- Info_all[rownames(train_express)]$stage
+train_express%<>%as.matrix()
+stopifnot(colnames(Bili)==Info_all$Samplename)
+train_Info <- Info[ind==1, ] 
+stopifnot(rownames(train_express)==rownames(train_Info))
+
+# test
+test_express <- Bili[,ind==2] 
+test_express%<>%t()%>%as.data.frame()
+test_express$stage <- Info_all[rownames(test_express)]$stage
+test_express%<>%as.matrix()
+stopifnot(colnames(Bili)==Info_all$Samplename)
+test_Info <- Info[ind==2, ] 
+stopifnot(rownames(test_express)==rownames(test_Info))
+```
+##2.2. fitting
+```{r,fig.height=5,fig.width=6}
+set.seed(123)
+fit <- glmnet::glmnet(x = train_express, y=train_Info, family = "cox",nlambda = 100,alpha = 1,standardize=T)
+plot(fit, xvar = "lambda", label = F,cex.lab=1.4,cex.axis=1)
+```
+##2.3. regression
+```{r,fig.height=5,fig.width=6}
+set.seed(123)
+cvfit <- cv.glmnet(train_express, train_Info, family = "cox",type.measure = "deviance",
+                   nfolds =10,alpha = 1,nlambda =100,standardize=T)
+plot(cvfit,cex.lab=1.4,cex.axis=1)
+```
+##2.4. coefficient
+```{r}
+Coef_DF <- coef(cvfit, s = "lambda.min") %>%
+  as.matrix() %>% as.data.frame() %>%
+  tibble::rownames_to_column(var = "Index") %>%
+  dplyr::rename(coef=`1`) %>%
+  dplyr::filter(coef!=0)
+```
+##2.5. add information
+```{r}
+#
+train_express %<>%as.data.frame()
+train_express$time <- train_Info[,"time"]
+train_express$status <- train_Info[,"status"]
+train_express$Sample <- rownames(train_express)
+#
+test_express %<>%as.data.frame()
+test_express$time <- test_Info[,"time"]
+test_express$status <- test_Info[,"status"]
+test_express$Sample <- rownames(test_express)
+```
+
+#3. Collinearity of variables
+
+##3.1. pearson correlation coefficient
+```{r,warning=FALSE}
+train_express$stage %<>%as.numeric()
+Cormat <- cor(train_express[,Coef_DF$Index],method="pearson")
+Corpvalue <- cor.mtest(train_express[,Coef_DF$Index],method="pearson")
+col  <-  colorRampPalette(rev(brewer.pal(n = 11, name ="RdBu")))(200) 
+```
+##3.2. plot
+```{r,fig.width=6,fig.height=6}
+corrplot(Cormat,type = "upper", method = "ellipse",order ="hclust",
+         p.mat = Corpvalue$p,sig.level = c(0.001, 0.01, 0.05), pch.cex = .8, insig = 'label_sig', pch.col = 'grey20',
+         col = col,
+         addCoef.col=NULL,
+         diag =T,
+         tl.col ="black",
+          tl.pos = "tl"
+         )
+corrplot(Cormat, type = "lower", method = "number", addCoef.col=NA,
+         col = col, tl.col = "black",order ="hclust",
+         tl.pos = "n",cl.pos = "n",
+         add = TRUE)
+```
+
+#4. Filtering 
+
+##4.1. multivariate regression
+```{r}
+set.seed(123)
+res.cox <- coxph( 
+  as.formula(paste0("Surv(time, status) ~ ",paste0(Coef_DF$Index,sep=" ",collapse = "+") )),
+  data = train_express)
+```
+##4.2. coxzph
+```{r,fig.width=6,fig.height=5}
+set.seed(123)
+ph_hypo_multi <- cox.zph(res.cox)
+ph_hypo_table <- ph_hypo_multi$table[-nrow(ph_hypo_multi$table),]
+ph_hypo_table <- apply(ph_hypo_table,MARGIN = 2,FUN = function(x)round(x,digits = 2))
+ph_hypo_table %<>%as.data.frame()
+ph_hypo_table$Variable <- rownames(ph_hypo_table)
+ph_hypo_table <- ph_hypo_table[,c("Variable","chisq","df","p")]
+#
+ph_hypo_table%<>%mutate(
+  "p>=0.05"=case_when(
+    p>=0.05 ~"Yes",
+    TRUE ~ "No"
+  )
+)
+```
+##4.3. plot
+```{r}
+ggtexttable(ph_hypo_table,rows = NULL,
+            theme = ttheme(base_size=20)
+            )
+```
+##4.4. vif
+```{r}
+vif <- rms::vif(res.cox)
+vif <- sqrt(vif)%>%as.data.frame()
+colnames(vif) <- "vif"
+#
+vif %<>% mutate(
+    "sqar(vif)<2"=case_when(
+    vif<2 ~"Yes",
+    TRUE ~ "No"
+  )
+)
+#
+vif$Variable <- rownames(vif)
+vif <- vif[,c("Variable","vif","sqar(vif)<2")]
+#
+ggtexttable(vif,rows = NULL,
+            theme = ttheme(base_size=20)
+            )
+```
+##4.5. Colusion
+```{r,fig.width=8,fig.height=8}
+data <- cbind(ph_hypo_table,vif)
+data <- data[,c("Variable","chisq","df","p","vif")]
+data$vif <- round(data$vif,digits = 2)
+data$Squar <- sqrt(data$vif)
+data$Squar <- round(data$Squar,digits = 2)
+colnames(data)[6] <- "sqrt(vif)"
+data <- data[,c(1,4,6)]
+#
+ggtexttable(data,rows = NULL,theme = ttheme(base_size=20))
+```
+
+#5. Forest plot
+
+##5.1. fitting
+```{r}
+#所有的变量
+train_express$stage%<>%as.factor()
+res.cox <- coxph(as.formula(paste0("Surv(time, status) ~ ",paste0(Coef_DF$Index,sep=" ",collapse = "+") )),data = train_express)
+#
+sum.surv <- summary(res.cox)
+```
+##5.2. plot
+```{r,fig.width=9,fig.height=6}
+ggforest(res.cox, data =  train_express, 
+         main = "Hazard ratio",
+         # refLabel = "1",
+         cpositions = c(0.01, 0.2, 0.35),
+         fontsize = 1.0) 
+```
+
+#6. AUC
+
+##6.1. model
+```{r}
+train_express$stage%<>%as.numeric()
+res.cox <- coxph(as.formula(paste0("Surv(time, status) ~ ",paste0(Coef_DF$Index,sep=" ",collapse = "+") )),data = train_express)
+Cofe_lasso <- summary(res.cox)$coefficients
+#
+res.cox <- coxph(as.formula(paste0("Surv(time, status) ~ ","stage")),data = train_express)
+Cofe_TMN <- summary(res.cox)$coefficients
+```
+##6.2.train
+###6.2.1. 
+```{r}
+Cofe_lasso <- Cofe_lasso[,1]
+Cofe_lasso%<>%as.data.frame()
+colnames(Cofe_lasso) <- "Coef"
+#
+train_express$stage%<>%as.numeric()
+a <- Coef_DF$Index
+a <- train_express[,a] 
+a %<>% t()%>%as.data.frame() 
+##
+Riskscore_lasso <- apply(a,MARGIN = 2,function(x){ 
+ y <- sum(x*Cofe_lasso$Coef) }
+ )%>%as.data.frame() 
+##
+colnames(Riskscore_lasso) <- "Riskscore" 
+Riskscore_lasso$Sample <- rownames(Riskscore_lasso) 
+Riskscore_lasso$time <- train_express[Riskscore_lasso$Sample,]$time 
+Riskscore_lasso$status <- train_express[Riskscore_lasso$Sample,]$status 
+```
+###6.2.2. 
+```{r}
+Cofe_TMN <- Cofe_TMN[,1]
+Cofe_TMN%<>%as.data.frame()
+colnames(Cofe_TMN) <- "Coef"
+#
+train_express$stage%<>%as.numeric()
+a <- "stage"
+a <-subset(train_express, select =a)
+a %<>% t()%>%as.data.frame() 
+##
+Riskscore_stage <- apply(a,MARGIN = 2,function(x){ 
+ y <- sum(x*Cofe_TMN$Coef) }
+ )%>%as.data.frame() 
+##
+colnames(Riskscore_stage) <- "Riskscore" 
+Riskscore_stage$Sample <- rownames(Riskscore_stage) 
+Riskscore_stage$time <- train_express[Riskscore_stage$Sample,]$time 
+Riskscore_stage$status <- train_express[Riskscore_stage$Sample,]$status 
+```
+###6.2.3. 
+```{r}
+multi_ROC <- function(time_vector, risk_score_table){ 
+single_ROC <- function(single_time){ 
+for_ROC <- survivalROC(Stime = risk_score_table$time, 
+                        status = risk_score_table$status, 
+                        marker = risk_score_table$Riskscore,
+                         predict.time = single_time, method = 'KM')
+  data.frame('True_positive'=for_ROC$TP, 'False_positive'=for_ROC$FP,
+              'Cut_values'=for_ROC$cut.values, 'Time_point'=rep(single_time, length(for_ROC$TP)), 
+             'AUC'=rep(for_ROC$AUC, length(for_ROC$TP))) 
+   } 
+  multi_ROC_list <- lapply(time_vector, single_ROC) 
+   do.call(rbind, multi_ROC_list) 
+}
+```
+###6.2.4. 
+```{r}
+#
+for_multi_ROC_lasso <- multi_ROC(time_vector =seq(from = 12, to = max(Riskscore_lasso$time), by = 24) , risk_score_table = Riskscore_lasso) 
+for_multi_ROC_lasso <- for_multi_ROC_lasso[,c("Time_point","AUC")]%>%unique()
+for_multi_ROC_lasso%<>%as.data.table()
+for_multi_ROC_lasso$Group <- "Lasso-cox"
+#
+for_multi_ROC_stage <- multi_ROC(time_vector =seq(from = 12, to = max(Riskscore_lasso$time), by = 24) , risk_score_table = Riskscore_stage) 
+for_multi_ROC_stage <- for_multi_ROC_stage[,c("Time_point","AUC")]%>%unique()
+for_multi_ROC_stage%<>%as.data.table()
+for_multi_ROC_stage$Group <- "TMN"
+```
+###6.2.5. 
+```{r,fig.width=6,fig.height=4}
+Plot_Data_train <- do.call(rbind,list(for_multi_ROC_lasso,for_multi_ROC_stage))
+ggplot(Plot_Data_train,aes(x=Time_point,y=AUC))+
+  geom_text(aes(label=AUC))+xlab("Time")+ylab("AUC")+
+  geom_line(aes(group=Group,color=Group),size=1.5)+
+  geom_point(color="grey",size=4)+
+  theme_classic2()+ggtitle("Training Set")+
+  theme(axis.text = element_text(size = 15),axis.title = element_text(size = 15),plot.title = element_text(hjust = .5,size = 15))+
+  scale_color_manual(values = c("#D13694","#627F9D"))
+```
+
+##6.3. test
+###6.3.1.
+```{r}
+#
+test_express$stage%<>%as.numeric()
+Cofe_lasso <- Cofe_lasso[,1]
+Cofe_lasso%<>%as.data.frame()
+colnames(Cofe_lasso) <- "Coef"
+#
+test_express$stage%<>%as.numeric()
+a <- Coef_DF$Index
+a <- test_express[,a]
+a %<>% t()%>%as.data.frame()
+##
+Riskscore_lasso <- apply(a,MARGIN = 2,function(x){
+ y <- sum(x*Cofe_lasso$Coef) }
+ )%>%as.data.frame()
+##
+colnames(Riskscore_lasso) <- "Riskscore"
+stopifnot(rownames(Riskscore_lasso)==rownames(Riskscore_lasso))
+Riskscore_lasso$Sample <- rownames(Riskscore_lasso)
+Riskscore_lasso$time <- test_express[Riskscore_lasso$Sample,]$time
+Riskscore_lasso$status <- test_express[Riskscore_lasso$Sample,]$status
+```
+###6.3.2.
+```{r}
+Cofe_TMN <- Cofe_TMN[,1]
+Cofe_TMN%<>%as.data.frame()
+colnames(Cofe_TMN) <- "Coef"
+#
+test_express$stage%<>%as.numeric()
+a <- "stage"
+a <-subset(test_express, select =a)
+a %<>% t()%>%as.data.frame()
+##
+Riskscore_stage <- apply(a,MARGIN = 2,function(x){
+ y <- sum(x*Cofe_TMN$Coef) }
+ )%>%as.data.frame()
+##
+colnames(Riskscore_stage) <- "Riskscore"
+Riskscore_stage$Sample <- rownames(Riskscore_stage)
+Riskscore_stage$time <- test_express[Riskscore_stage$Sample,]$time
+Riskscore_stage$status <- test_express[Riskscore_stage$Sample,]$status
+```
+###6.3.3.
+```{r}
+#
+for_multi_ROC_lasso <- multi_ROC(time_vector =seq(from = 12, to = max(Riskscore_lasso$time), by = 24) , risk_score_table = Riskscore_lasso)
+for_multi_ROC_lasso <- for_multi_ROC_lasso[,c("Time_point","AUC")]%>%unique()
+for_multi_ROC_lasso%<>%as.data.table()
+for_multi_ROC_lasso$Group <- "Lasso-cox"
+#
+for_multi_ROC_stage <- multi_ROC(time_vector =seq(from = 12, to = max(Riskscore_lasso$time), by = 24) , risk_score_table = Riskscore_stage)
+for_multi_ROC_stage <- for_multi_ROC_stage[,c("Time_point","AUC")]%>%unique()
+for_multi_ROC_stage%<>%as.data.table()
+for_multi_ROC_stage$Group <- "TMN"
+```
+###6.3.4.
+```{r,fig.width=6,fig.height=4}
+Plot_Data_test <- do.call(rbind,list(for_multi_ROC_lasso,for_multi_ROC_stage))
+#
+ggplot(Plot_Data_test,aes(x=Time_point,y=AUC))+
+  geom_text(aes(label=AUC))+xlab("Time")+ylab("AUC")+
+  geom_line(aes(group=Group,color=Group),size=1.5)+
+  geom_point(color="grey",size=4)+
+  theme_classic2()+ggtitle("Validation Set")+
+  theme(axis.text = element_text(size = 15),axis.title = element_text(size = 15),plot.title = element_text(hjust = .5,size = 15))+
+  scale_color_manual(values = c("#D13694","#627F9D"))
+```
+
+#7. AUC 
+
+##7.1 risk score 
+```{r}
+#
+train_express$stage%<>%as.numeric()
+res.cox <- coxph(as.formula(paste0("Surv(time, status) ~ ",paste0(Coef_DF$Index,sep=" ",collapse = "+") )),data = train_express)
+Cofe <- summary(res.cox)$coefficients
+Cofe <- Cofe[,1]
+Cofe%<>%as.data.frame()
+colnames(Cofe) <- "Coef"
+
+#
+train_express$stage%<>%as.numeric()
+a <- Coef_DF$Index
+a <- train_express[,a] 
+a %<>% t()%>%as.data.frame() 
+a <- a[rownames(Cofe),]
+##
+Riskscore_train1 <- apply(a,MARGIN = 2,function(x){ 
+ y <- sum(x*Cofe$Coef) }
+ )%>%as.data.frame() 
+##
+colnames(Riskscore_train1) <- "Riskscore" 
+Riskscore_train1$Sample <- rownames(Riskscore_train1) 
+Riskscore_train1$time <- train_express[Riskscore_train1$Sample,]$time 
+Riskscore_train1$status <- train_express[Riskscore_train1$Sample,]$status 
+
+#
+test_express$stage%<>%as.numeric() 
+a <- Coef_DF$Index
+a <- test_express[,a]
+a %<>% t()%>%as.data.frame()
+a <- a[rownames(Cofe),]
+##
+Riskscore_test1 <- apply(a,MARGIN = 2,function(x){
+y <- sum(x*Cofe$Coef) 
+}
+)%>%as.data.frame() 
+
+colnames(Riskscore_test1) <- "Riskscore" 
+Riskscore_test1$Sample <- rownames(Riskscore_test1) 
+Riskscore_test1$time <- test_express[Riskscore_test1$Sample,]$time 
+Riskscore_test1$status <- test_express[Riskscore_test1$Sample,]$status 
+```
+##7.2. 
+
+###7.2.2. 
+```{r}
+##
+for_multi_ROC_train <- multi_ROC(time_vector = c(12*3,12*5), risk_score_table = Riskscore_train1) 
+for_multi_ROC_train%<>%mutate(
+Time_point=case_when( 
+Time_point== 36 ~ "3 years", 
+Time_point== 60 ~ "5 years" 
+)
+)
+##
+for_multi_ROC_test <- multi_ROC(time_vector = c(12*3,12*5), risk_score_table = Riskscore_test1)
+for_multi_ROC_test%<>%mutate( 
+Time_point=case_when(
+Time_point== 36 ~ "3 years",
+Time_point== 60 ~ "5 years" 
+) 
+) 
+``` 
+##7.2.3.
+```{r}
+##
+AUC_tarin <- for_multi_ROC_train[,c("Time_point","AUC")]%>%unique()
+ggplot()+ geom_xspline(data = for_multi_ROC_train,aes(x = False_positive, y = True_positive,group=Time_point,color=Time_point),size=1) +
+  geom_line(aes(x=c(0,1),y=c(0,1)),color = "grey",size = 1,linetype=2 )+
+  theme_bw()+
+  xlab("1-specificity")+ylab("sensitivity")+
+  theme(axis.title = element_text(size = 16),axis.text = element_text(size = 13))+
+  annotate(geom = "text",
+           label=paste0(
+             AUC_tarin$Time_point[1]," : ",round(AUC_tarin$AUC[1],2),
+            "\n",
+             AUC_tarin$Time_point[2]," : ",round(AUC_tarin$AUC[2],2)
+                        ),
+           x=0.75,y=0.25,size=6)+
+  ggsci::scale_color_aaas()+
+  ggtitle("Training Cohort")+theme(plot.title = element_text(hjust = .5,size = 25))+
+  theme(legend.text = element_text(size = 15),legend.title = element_text(size = 18))
+
+
+##
+AUC_test <- for_multi_ROC_test[,c("Time_point","AUC")]%>%unique()
+ggplot()+
+  geom_xspline(data = for_multi_ROC_test,aes(x = False_positive, y = True_positive,group=Time_point,color=Time_point),size=1) +
+  geom_line(aes(x=c(0,1),y=c(0,1)),color = "grey",size = 1,linetype=2 )+
+  theme_bw()+
+  xlab("1-specificity")+ylab("sensitivity")+
+  theme(axis.title = element_text(size = 16),axis.text = element_text(size = 13))+
+  annotate(geom = "text",
+           label=paste0(
+             AUC_test$Time_point[1]," : ",round(AUC_test$AUC[1],2),
+            "\n",
+             AUC_test$Time_point[2]," : ",round(AUC_test$AUC[2],2)
+                        ),
+           x=0.75,y=0.25,size=6)+
+  ggsci::scale_color_aaas()+
+  ggtitle("Validation Cohort")+theme(plot.title = element_text(hjust = .5,size = 25))+
+   theme(legend.text = element_text(size = 15),legend.title = element_text(size = 18)) 
+```
+##7.3.
+
+###7.3.1. 
+```{r,fig.width=4.5,fig.height=4}
+Riskscore_train1$Group <- factor(Riskscore_train1$status,levels = c("0","1"))
+ggplot(Riskscore_train1,aes(x=Group,y=Riskscore,color=Group))+geom_boxplot()+geom_jitter()+
+  theme_classic2()+ggsci::scale_color_d3()+stat_compare_means(method = "t.test",size=5)+xlab("Event")+ggtitle("Training set")+
+  theme(axis.text = element_text(size = 15),axis.title = element_text(size = 15),plot.title = element_text(hjust=.5,size=15))+guides(color=FALSE)
+```
+###7.3.2. 
+```{r,fig.width=4.5,fig.height=4}
+Riskscore_test1$Group <- factor(Riskscore_test1$status,levels = c("0","1"))
+ggplot(Riskscore_test1,aes(x=Group,y=Riskscore,color=Group))+geom_boxplot()+geom_jitter()+
+  theme_classic2()+ggsci::scale_color_d3()+stat_compare_means(method = "t.test",size=5)+xlab("Event")+ggtitle("Validation set")+
+  theme(axis.text = element_text(size = 15),axis.title = element_text(size = 15),plot.title = element_text(hjust=.5,size=15))+guides(color=FALSE)
+```
+
+##7.4 risk score
+
+###7.4.1.
+```{r,fig.width=5.6,fig.height=5.5}
+Riskscore_train1%<>%mutate(
+  Class=case_when(
+    Riskscore >= median(Riskscore_train1$Riskscore) ~ "High risk",
+    Riskscore < median(Riskscore_train1$Riskscore)  ~ "Low risk",
+  )
+)
+Riskscore_train1$Class <- factor(Riskscore_train1$Class,levels = c("Low risk","High risk"))
+
+#
+fit <- survfit(Surv(time, status) ~ Class, data = Riskscore_train1)
+p <- ggsurvplot(fit
+                ,pval = T
+                ,conf.int = F
+                ,risk.table = TRUE
+                ,surv.median.line = "hv" # Specify median survival
+                ,ggtheme = theme_bw() # Change ggplot2 theme
+                ,palette = c("#1B4586","#D92F20")
+                ,font.x=c(14),font.y=c(14),font.tickslab=c(11),font.legend=c(15)
+                ,legend.title=""
+                ,tables.y.text=F,risk.table.fontsize=c(5)
+                ,title="Training Cohort",font.title=25
+           )
+
+p$plot <- p$plot+theme(plot.title = element_text(hjust = .5))+
+                 scale_color_manual(values = c("#D92F20", "#1B4586"),breaks = c("Class=Low risk","Class=High risk"),labels=c("Low risk","High risk"),name="Group")+
+                 theme(legend.position = c(.2,.25),legend.background = element_blank(),legend.text = element_text(size = 17),legend.title = element_text(size = 17),
+                       panel.grid = element_blank(),axis.title.x = element_blank(),axis.text.x = element_blank(),axis.ticks.x = element_blank(),panel.border = element_rect(size = 1.3)
+                       )
+p$table <- p$table+theme(axis.title.x = element_text(size = 18),plot.title = element_blank(),axis.text.x = element_text(size = 12),panel.grid = element_blank(),panel.border = element_rect(size = 1.3))
+
+#
+p
+```
+###7.4.2.
+```{r,fig.width=5.6,fig.height=5.5}
+Riskscore_test1%<>%mutate(
+  Class=case_when(
+    Riskscore >= median(Riskscore_test1$Riskscore) ~ "High risk",
+    Riskscore < median(Riskscore_test1$Riskscore)  ~ "Low risk",
+  )
+)
+Riskscore_test1$Class <- factor(Riskscore_test1$Class,levels = c("Low risk","High risk"))
+
+#
+fit <- survfit(Surv(time, status) ~ Class, data = Riskscore_test1)
+p <- ggsurvplot(fit
+                ,pval = T
+                ,conf.int = F
+                ,risk.table = TRUE
+                ,surv.median.line = "hv" # Specify median survival
+                ,ggtheme = theme_bw() # Change ggplot2 theme
+                ,palette = c("#1B4586","#D92F20")
+                ,font.x=c(14),font.y=c(14),font.tickslab=c(11),font.legend=c(15)
+                ,legend.title=""
+                ,tables.y.text=F,risk.table.fontsize=c(5)
+                ,title="Validation Cohort",font.title=25
+           )
+
+p$plot <- p$plot+theme(plot.title = element_text(hjust = .5))+
+                 scale_color_manual(values = c("#D92F20", "#1B4586"),breaks = c("Class=Low risk","Class=High risk"),labels=c("Low risk","High risk"),name="Group")+
+                 theme(legend.position = c(.35,.25),legend.background = element_blank(),legend.text = element_text(size = 17),legend.title = element_text(size = 17),
+                       panel.grid = element_blank(),axis.title.x = element_blank(),axis.text.x = element_blank(),axis.ticks.x = element_blank(),panel.border = element_rect(size = 1.3)
+                       )
+
+p$table <- p$table+theme(axis.title.x = element_text(size = 18),plot.title = element_blank(),axis.text.x = element_text(size = 12),panel.grid = element_blank(),panel.border = element_rect(size = 1.3))
+#
+
+p
+```
+
+
+#8. nomograph
+
+##8.1. 
+```{r,fig.width=13,fig.height=9}
+nomodata <- train_express
+nomodata <- nomodata[,c("time","status",Coef_DF$Index)]
+dd <- datadist(nomodata)
+options(datadist='dd') 
+```
+##8.2. 
+```{r}
+cox.nomo <- rms::cph(
+                     Surv(time, status) ~ CD8.distal +CD8PD1.distal+PD1TIM3.distal+CD8PD1.intratumoal+stage, 
+                     x = T,y = T,
+                     data = nomodata,
+                     surv = T
+  )
+```
+##8.3. 
+```{r}
+S_0 <- rms::Survival(cox.nomo)
+
+S_1 <- function(x)S_0(1*12,lp=x) 
+S_2 <- function(x)S_0(3*12,lp=x) 
+S_3 <- function(x)S_0(5*12,lp=x)
+```
+##8.4. 
+```{r,fig.width=13,fig.height=9}
+nomo <- rms::nomogram(cox.nomo,fun = list(S_1,S_2,S_3)
+                 ,lp= F
+                 ,fun.at=c("1.0",'0.9','0.85','0.80','0.70','0.6','0.5','0.4','0.3','0.2','0.1',"0.05","0")
+                 ,funlabel = c("1-years survival","3-years survival","5-years survival")
+                 )
+```
+##8.5. 
+```{r,fig.width=16,fig.height=8}
+plot(nomo
+     ,xfrac=.18     
+     ,cex.axis=.9  
+     )
+```
+
+
+
+
+
+
+
+
