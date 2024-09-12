@@ -20,6 +20,7 @@ library(survival)
 library(survminer)
 library(gghalves)
 library(ComplexHeatmap)
+library(factoextra)
 ```
 ##1.2. data
 ```{r,message=FALSE,warning=FALSE}
